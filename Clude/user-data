@@ -1,0 +1,190 @@
+#cloud-config
+
+hostname: alpine-vm
+fqdn: alpine-vm.local
+manage_etc_hosts: true
+
+users:
+  - default
+  - name: root
+    lock_passwd: false
+  - name: max
+    groups: wheel,video,audio,input
+    shell: /bin/ash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICbO/UEMM/m/sAdcZjtwXsiOetx0j35avGqeFtlw7N+E max@max-HP-EliteBook-Folio-1040-G2
+
+ssh_pwauth: true
+disable_root: false
+
+chpasswd:
+  list: |
+    root:rootpassword
+    max:maxpassword
+  expire: false
+
+package_update: true
+package_upgrade: true
+
+packages:
+  # X11 server
+  - xorg-server
+  - xorg-server-common
+  - xinit
+  - xf86-input-libinput
+  - xf86-video-modesetting
+  # Mesa / OpenGL — required for virtio-gpu DRM
+  - mesa-dri-gallium
+  - mesa-gl
+  - mesa-egl
+  - libdrm
+  # Window manager + browser
+  - openbox
+  - firefox
+  - font-dejavu
+  # D-Bus (needed by Firefox and Openbox)
+  - dbus
+  - dbus-openrc
+  - dbus-x11
+  # Device manager (eudev = Alpine's udev)
+  - eudev
+  - eudev-openrc
+  # Seat / session management
+  - elogind
+  - elogind-openrc
+  # Utilities
+  - sudo
+  - util-linux
+  - setxkbmap
+  - xrandr
+
+runcmd:
+  # ── Load GPU kernel modules ──────────────────────────────────────────────
+  - |
+    for mod in virtio_gpu drm drm_kms_helper; do
+      echo "$mod" >> /etc/modules
+      modprobe "$mod" 2>/dev/null || true
+    done
+
+  # ── Start device + session services ─────────────────────────────────────
+  - rc-update add eudev sysinit
+  - rc-service eudev start || true
+  - rc-update add dbus default
+  - rc-service dbus start || true
+  - rc-update add elogind default
+  - rc-service elogind start || true
+
+  # ── udev: make /dev/dri/card0 accessible to the video group ─────────────
+  - |
+    cat > /etc/udev/rules.d/99-drm.rules << 'EOR'
+    SUBSYSTEM=="drm", GROUP="video", MODE="0660"
+    SUBSYSTEM=="input", GROUP="input", MODE="0660"
+    EOR
+  - udevadm control --reload-rules 2>/dev/null || true
+  - udevadm trigger 2>/dev/null || true
+
+  # ── Xorg config for virtio-gpu via modesetting driver ───────────────────
+  - mkdir -p /etc/X11/xorg.conf.d
+  - |
+    cat > /etc/X11/xorg.conf.d/10-virtio-gpu.conf << 'EOX'
+    Section "ServerFlags"
+        Option "AutoAddDevices"    "true"
+        Option "AutoEnableDevices" "true"
+        Option "AllowEmptyInput"   "true"
+    EndSection
+
+    Section "Device"
+        Identifier "VirtIO GPU"
+        Driver     "modesetting"
+        Option     "AccelMethod" "none"
+    EndSection
+
+    Section "Screen"
+        Identifier "Screen0"
+        Device     "VirtIO GPU"
+        DefaultDepth 24
+        SubSection "Display"
+            Depth  24
+            Modes  "1280x800" "1024x768" "800x600"
+        EndSubSection
+    EndSection
+    EOX
+
+  # ── Allow non-root Xorg startup ──────────────────────────────────────────
+  - |
+    cat > /etc/X11/Xwrapper.config << 'EOW'
+    allowed_users=anybody
+    needs_root_rights=no
+    EOW
+
+  # ── Prepare user home dirs ───────────────────────────────────────────────
+  - mkdir -p /home/max/.config/openbox
+  - mkdir -p /home/max/.local/share
+
+  # ── Openbox autostart ────────────────────────────────────────────────────
+  # Openbox runs this script on session start.
+  # Firefox is wrapped in a watchdog loop so it restarts if it crashes.
+  - |
+    cat > /home/max/.config/openbox/autostart << 'EOA'
+    # Disable screen blanking and power management
+    xset -dpms &
+    xset s off &
+    xset s noblank &
+
+    # Set display resolution (virtio-gpu output is named Virtual-1)
+    xrandr --output Virtual-1 --mode 1280x800 2>/dev/null         || xrandr --output Virtual-1 --mode 1024x768 2>/dev/null         || true &
+
+    # Kiosk watchdog: restart Firefox automatically if it exits
+    (
+      while true; do
+        firefox --kiosk https://example.com                 --no-remote                 --disable-pinch                 2>/tmp/firefox.log
+        sleep 2
+      done
+    ) &
+    EOA
+  - chmod +x /home/max/.config/openbox/autostart
+
+  # ── .xinitrc: launch dbus session then openbox ───────────────────────────
+  - |
+    cat > /home/max/.xinitrc << 'EOX'
+    #!/bin/sh
+    # Start a per-session dbus instance
+    eval $(dbus-launch --sh-syntax --exit-with-session)
+    export DBUS_SESSION_BUS_ADDRESS
+    # Hand off to openbox (reads ~/.config/openbox/autostart)
+    exec openbox-session
+    EOX
+  - chmod +x /home/max/.xinitrc
+
+  # ── .profile: trigger startx automatically when on tty1 ─────────────────
+  # ash reads .profile for every login shell (which agetty --autologin creates).
+  - |
+    cat > /home/max/.profile << 'EOP'
+    #!/bin/sh
+    if [ "$(tty)" = "/dev/tty1" ] && [ -z "${DISPLAY}" ]; then
+        # Xorg log at /tmp/xorg-startup.log — check it if GUI does not appear
+        exec startx "${HOME}/.xinitrc" -- :0 vt1 -nolisten tcp             > /tmp/xorg-startup.log 2>&1
+    fi
+    EOP
+  - chmod +x /home/max/.profile
+
+  # ── Autologin on tty1 via agetty (part of util-linux) ───────────────────
+  # Replaces the default getty with one that auto-logs in max.
+  # --autologin skips the password prompt entirely.
+  - sed -Ei "s|^tty1.*|tty1::respawn:/sbin/agetty --autologin max --noclear tty1 linux|" /etc/inittab
+
+  # ── Fix file ownership ───────────────────────────────────────────────────
+  - chown -R max:max /home/max
+
+  # ── Debug tips (SSH in after first boot if GUI fails) ───────────────────
+  # cat /tmp/xorg-startup.log     — Xorg errors
+  # cat /tmp/firefox.log          — Firefox errors
+  # ls -la /dev/dri/              — check /dev/dri/card0 exists
+  # groups max            — confirm video group
+
+power_state:
+  mode: reboot
+  delay: now
+  message: "cloud-init done — rebooting to GUI"

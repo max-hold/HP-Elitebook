@@ -1,0 +1,125 @@
+#cloud-config
+
+# ── User ──────────────────────────────────────────────────────────────────────
+users:
+  - name: kiosk
+    gecos: Kiosk User
+    groups:
+      - audio
+      - video
+      - input
+      - seat       # needed by elogind for device access
+    shell: /bin/sh
+    lock_passwd: true
+
+# ── Packages ──────────────────────────────────────────────────────────────────
+packages:
+  - xorg-server
+  - xf86-video-fbdev
+  - xf86-video-vesa
+  - xf86-input-libinput
+  - openbox
+  - firefox
+  - ttf-freefont
+  - dbus
+  - elogind       # seat + device manager — lets non-root user run Xorg
+  - setxkbmap
+  - xdotool
+  - xrandr
+  - unclutter
+
+package_update: true
+
+# ── Files ─────────────────────────────────────────────────────────────────────
+write_files:
+
+  - path: /home/kiosk/.xinitrc
+    owner: kiosk:kiosk
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # Redirect everything so failures are visible in /tmp/xorg.log
+      exec >> /tmp/xorg.log 2>&1
+      echo "[xinitrc] started at $(date)"
+      eval $(dbus-launch --sh-syntax)
+      setxkbmap us
+      xset s off
+      xset s noblank
+      xset -dpms
+      unclutter -idle 0 &
+      exec openbox-session
+
+  - path: /home/kiosk/.config/openbox/autostart
+    owner: kiosk:kiosk
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      sleep 1
+      exec firefox --kiosk --no-remote "https://example.com" &
+
+  - path: /home/kiosk/.config/openbox/rc.xml
+    owner: kiosk:kiosk
+    permissions: '0644'
+    content: |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <openbox_config xmlns="http://openbox.org/3.4/rc">
+        <resistance><strength>10</strength><screen_edge_strength>20</screen_edge_strength></resistance>
+        <focus><focusNew>yes</focusNew><followMouse>no</followMouse><focusDelay>200</focusDelay></focus>
+        <placement><policy>Smart</policy></placement>
+        <theme><name>Clearlooks</name><titleLayout>NLIMC</titleLayout></theme>
+        <desktops><number>1</number><names><name>Kiosk</name></names></desktops>
+        <keyboard>
+          <keybind key="A-F4"><action name="Close"/></keybind>
+        </keyboard>
+        <mouse><dragThreshold>8</dragThreshold><doubleClickTime>200</doubleClickTime></mouse>
+        <applications>
+          <application class="Firefox">
+            <maximized>yes</maximized>
+            <decor>no</decor>
+            <fullscreen>yes</fullscreen>
+          </application>
+        </applications>
+      </openbox_config>
+
+  - path: /home/kiosk/.profile
+    owner: kiosk:kiosk
+    permissions: '0644'
+    content: |
+      # Use case-match so it works whether tty prints "/dev/tty1" or "tty1"
+      case "$(tty)" in
+        *tty1)
+          [ -z "$DISPLAY" ] && exec startx -- -nocursor >> /tmp/xorg.log 2>&1
+          ;;
+      esac
+
+  - path: /etc/X11/xorg.conf.d/10-fbdev.conf
+    permissions: '0644'
+    content: |
+      Section "Device"
+        Identifier "Framebuffer"
+        Driver     "fbdev"
+      EndSection
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+runcmd:
+  - chown -R kiosk:kiosk /home/kiosk
+  # elogind: seat & device manager required for non-root Xorg
+  - rc-update add elogind default
+  - rc-service elogind start
+  - rc-update add dbus default
+  - rc-service dbus start
+  # Write autologin helper in runcmd (guaranteed on-disk before inittab is touched)
+  - printf '#!/bin/sh\nexec /bin/login -f kiosk\n' > /usr/local/bin/autologin
+  - chmod 755 /usr/local/bin/autologin
+  - sed -i 's|tty1::respawn:/sbin/getty.*|tty1::respawn:/sbin/getty -n -l /usr/local/bin/autologin 38400 tty1 linux|' /etc/inittab
+  - kill -HUP 1
+
+# ── Auto-reboot after provisioning ────────────────────────────────────────────
+# Without this the VM sits at a text console after cloud-init finishes.
+power_state:
+  mode: reboot
+  delay: now
+  message: "cloud-init done — rebooting into kiosk mode"
+
+final_message: |
+  ✓ Openbox kiosk setup complete — rebooting now.
